@@ -2088,6 +2088,54 @@ TEST_P(SimpleTcpSocketTest, ConnectUnspecifiedAddress) {
   }
 }
 
+// Tests that send will return EWOULDBLOCK initially with large buffer and will
+// succeed after the send buffer size is increased.
+TEST_P(TcpSocketTest, SendUnblocksOnSendBufferIncrease) {
+  // Set the FD to O_NONBLOCK.
+  int opts;
+  ASSERT_THAT(opts = fcntl(first_fd, F_GETFL), SyscallSucceeds());
+  opts |= O_NONBLOCK;
+  ASSERT_THAT(fcntl(first_fd, F_SETFL, opts), SyscallSucceeds());
+
+  int buffer_sz = 1 << 18;
+  EXPECT_THAT(setsockopt(first_fd, SOL_SOCKET, SO_SNDBUF, &buffer_sz,
+                         sizeof(buffer_sz)),
+              SyscallSucceedsWithValue(0));
+
+  // Create a large buffer that will be used for sending.
+  std::vector<char> buffer(1 << 19);
+
+  // Write until we receive an error.
+  while (RetryEINTR(send)(first_fd, buffer.data(), buffer.size(), 0) != -1) {
+    // Sleep to give linux a chance to move data from the send buffer to the
+    // receive buffer.
+    usleep(10000);  // 10ms.
+  }
+
+  // The last error should have been EWOULDBLOCK.
+  ASSERT_EQ(errno, EWOULDBLOCK);
+
+  ScopedThread send_thread([this]() {
+    int flags = 0;
+    ASSERT_THAT(flags = fcntl(first_fd, F_GETFL), SyscallSucceeds());
+    EXPECT_THAT(fcntl(first_fd, F_SETFL, flags & ~O_NONBLOCK),
+                SyscallSucceeds());
+
+    // Expect the send() to succeed.
+    char buffer;
+    ASSERT_THAT(RetryEINTR(send)(first_fd, &buffer, sizeof(buffer), 0),
+                SyscallSucceeds());
+  });
+
+  // Set SO_SNDBUF to 1MiB.
+  buffer_sz = 1 << 20;
+  EXPECT_THAT(setsockopt(first_fd, SOL_SOCKET, SO_SNDBUF, &buffer_sz,
+                         sizeof(buffer_sz)),
+              SyscallSucceedsWithValue(0));
+
+  send_thread.Join();
+}
+
 INSTANTIATE_TEST_SUITE_P(AllInetTests, SimpleTcpSocketTest,
                          ::testing::Values(AF_INET, AF_INET6));
 
