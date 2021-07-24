@@ -17,12 +17,28 @@
 #ifndef GVISOR_TEST_UTIL_CAPABILITY_UTIL_H_
 #define GVISOR_TEST_UTIL_CAPABILITY_UTIL_H_
 
-#if defined(__Fuchsia__)
-#include "test/util/fuchsia_capability_util.h"
-#elif defined(__linux__)
+#if defined(__linux__)
 #include "test/util/linux_capability_util.h"
-#else
+#elif !defined(__Fuchsia__)
 #error "Unhandled platform"
 #endif
+
+namespace gvisor {
+namespace testing {
+
+// On Linux, access to raw IP and packet socket is controlled by a single
+// capability (CAP_NET_RAW). However on Fuchsia, access to raw IP and packet
+// sockets are controlled by separate capabilities/protocols.
+
+// HaveRawIPSocketCapability returns true iff the process has access to raw
+// IP sockets.
+PosixErrorOr<bool> HaveRawIPSocketCapability();
+
+// HavePacketSocketCapability returns true iff the process has access to packet
+// sockets.
+PosixErrorOr<bool> HavePacketSocketCapability();
+
+}  // namespace testing
+}  // namespace gvisor
 
 #endif  // GVISOR_TEST_UTIL_CAPABILITY_UTIL_H_

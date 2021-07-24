@@ -14,8 +14,7 @@
 
 #ifdef __Fuchsia__
 
-#include "test/util/fuchsia_capability_util.h"
-
+#include <netinet/if_ether.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 
@@ -24,19 +23,26 @@
 namespace gvisor {
 namespace testing {
 
-PosixErrorOr<bool> HaveCapability(int cap) {
-  if (cap == CAP_NET_RAW) {
-    auto s = Socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
-    if (s.ok()) {
-      return true;
-    }
-    if (s.error().errno_value() == EPERM) {
-      return false;
-    }
-    return s.error();
+PosixErrorOr<bool> HaveRawIPSocketCapability() {
+  auto s = Socket(AF_INET, SOCK_RAW, IPPROTO_UDP);
+  if (s.ok()) {
+    return true;
   }
+  if (s.error().errno_value() == EPERM) {
+    return false;
+  }
+  return s.error();
+}
 
-  return false;
+PosixErrorOr<bool> HavePacketSocketCapability() {
+  auto s = Socket(AF_PACKET, SOCK_RAW, ETH_P_ALL);
+  if (s.ok()) {
+    return true;
+  }
+  if (s.error().errno_value() == EPERM) {
+    return false;
+  }
+  return s.error();
 }
 
 }  // namespace testing
