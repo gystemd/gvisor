@@ -6,16 +6,20 @@ go_library(
     name = "control",
     srcs = [
         "control.go",
+        "fs.go",
+        "lifecycle.go",
         "logging.go",
         "pprof.go",
         "proc.go",
         "state.go",
+        "usage.go",
     ],
     visibility = [
         "//:sandbox",
     ],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/context",
         "//pkg/fd",
         "//pkg/log",
         "//pkg/sentry/fdimport",
@@ -35,6 +39,7 @@ go_library(
         "//pkg/sync",
         "//pkg/tcpip/link/sniffer",
         "//pkg/urpc",
+        "//pkg/usermem",
     ],
 )
 

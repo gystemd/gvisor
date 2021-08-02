@@ -57,19 +57,11 @@ const (
 	// ContMgrExecuteAsync executes a command in a container.
 	ContMgrExecuteAsync = "containerManager.ExecuteAsync"
 
-	// ContMgrPause pauses the sandbox (note that individual containers cannot be
-	// paused).
-	ContMgrPause = "containerManager.Pause"
-
 	// ContMgrProcesses lists processes running in a container.
 	ContMgrProcesses = "containerManager.Processes"
 
 	// ContMgrRestore restores a container from a statefile.
 	ContMgrRestore = "containerManager.Restore"
-
-	// ContMgrResume unpauses the paused sandbox (note that individual containers
-	// cannot be resumed).
-	ContMgrResume = "containerManager.Resume"
 
 	// ContMgrSignal sends a signal to a container.
 	ContMgrSignal = "containerManager.Signal"
@@ -109,6 +101,23 @@ const (
 // Logging related commands (see logging.go for more details).
 const (
 	LoggingChange = "Logging.Change"
+)
+
+// Lifecycle related commands (see lifecycle.go for more details).
+const (
+	LifecyclePause  = "Lifecycle.Pause"
+	LifecycleResume = "Lifecycle.Resume"
+)
+
+// Filesystem related commands (see fs.go for more details).
+const (
+	FsCat = "Fs.Cat"
+)
+
+// Usage related commands (see usage.go for more details).
+const (
+	UsageCollect = "Usage.Collect"
+	UsageUsageFD = "Usage.UsageFD"
 )
 
 // ControlSocketAddr generates an abstract unix socket name for the given ID.
@@ -152,6 +161,9 @@ func newController(fd int, l *Loader) (*controller, error) {
 
 	ctrl.srv.Register(&debug{})
 	ctrl.srv.Register(&control.Logging{})
+	ctrl.srv.Register(&control.Lifecycle{l.k})
+	ctrl.srv.Register(&control.Fs{l.k})
+	ctrl.srv.Register(&control.Usage{l.k})
 
 	if l.root.conf.ProfileEnable {
 		ctrl.srv.Register(control.NewProfile(l.k))
@@ -340,17 +352,6 @@ func (cm *containerManager) Checkpoint(o *control.SaveOpts, _ *struct{}) error {
 	return state.Save(o, nil)
 }
 
-// Pause suspends a sandbox.
-func (cm *containerManager) Pause(_, _ *struct{}) error {
-	log.Debugf("containerManager.Pause")
-	// TODO(gvisor.dev/issues/6243): save/restore not supported w/ hostinet
-	if cm.l.root.conf.Network == config.NetworkHost {
-		return errors.New("pause not supported when using hostinet")
-	}
-	cm.l.k.Pause()
-	return nil
-}
-
 // RestoreOpts contains options related to restoring a container's file system.
 type RestoreOpts struct {
 	// FilePayload contains the state file to be restored, followed by the
@@ -479,13 +480,6 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 		return fmt.Errorf("starting sandbox: %v", err)
 	}
 
-	return nil
-}
-
-// Resume unpauses a sandbox.
-func (cm *containerManager) Resume(_, _ *struct{}) error {
-	log.Debugf("containerManager.Resume")
-	cm.l.k.Unpause()
 	return nil
 }
 

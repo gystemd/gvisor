@@ -17,6 +17,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -38,6 +39,7 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/boot"
@@ -981,7 +983,7 @@ func (s *Sandbox) Pause(cid string) error {
 	}
 	defer conn.Close()
 
-	if err := conn.Call(boot.ContMgrPause, nil, nil); err != nil {
+	if err := conn.Call(boot.LifecyclePause, nil, nil); err != nil {
 		return fmt.Errorf("pausing container %q: %v", cid, err)
 	}
 	return nil
@@ -996,9 +998,89 @@ func (s *Sandbox) Resume(cid string) error {
 	}
 	defer conn.Close()
 
-	if err := conn.Call(boot.ContMgrResume, nil, nil); err != nil {
+	if err := conn.Call(boot.LifecycleResume, nil, nil); err != nil {
 		return fmt.Errorf("resuming container %q: %v", cid, err)
 	}
+	return nil
+}
+
+// Cat sends the cat call for a container in the sandbox.
+func (s *Sandbox) Cat(cid string, files []string) error {
+	log.Debugf("Cat sandbox %q", s.ID)
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := conn.Call(boot.FsCat, &control.CatOpts{
+		Files:       files,
+		FilePayload: urpc.FilePayload{Files: []*os.File{os.Stdout}},
+	}, nil); err != nil {
+		return fmt.Errorf("Cat container %q: %v", cid, err)
+	}
+	return nil
+}
+
+// Usage sends the collect call for a container in the sandbox. The output is
+// print to stdout.
+func (s *Sandbox) Usage(cid string, Full bool) error {
+	log.Debugf("Usage sandbox %q", s.ID)
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var m control.MemoryUsage
+	if err := conn.Call(boot.UsageCollect, &control.MemoryUsageOpts{
+		Full: Full,
+	}, &m); err != nil {
+		return fmt.Errorf("Usage container %q: %v", cid, err)
+	}
+	return json.NewEncoder(os.Stdout).Encode(m)
+}
+
+// UsageFD sends the usagefd call for a container in the sandbox. The result is
+// print to stdout.
+func (s *Sandbox) UsageFD(cid string) error {
+	log.Debugf("Usage sandbox %q", s.ID)
+	conn, err := s.sandboxConnect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var m control.MemoryUsageFile
+	if err := conn.Call(boot.UsageUsageFD, &control.MemoryUsageFileOpts{
+		Version: 1,
+	}, &m); err != nil {
+		return err
+	}
+
+	if len(m.FilePayload.Files) != 2 {
+		return fmt.Errorf("wants exactly two fds")
+	}
+
+	// Explicitly close these files.
+	defer m.FilePayload.Files[0].Close()
+	defer m.FilePayload.Files[1].Close()
+
+	mmap, _, e := unix.RawSyscall6(unix.SYS_MMAP, 0, usage.RTMemoryStatsSize, unix.PROT_READ, unix.MAP_SHARED, m.FilePayload.Files[0].Fd(), 0)
+	if e != 0 {
+		return fmt.Errorf("mmap returned %d, want 0", e)
+	}
+
+	defer unix.RawSyscall(unix.SYS_MUNMAP, mmap, usage.RTMemoryStatsSize, 0)
+	mem := usage.RTMemoryStatsPointer(mmap)
+
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(m.FilePayload.Files[1].Fd()), &stat); err != nil {
+		return err
+	}
+	filememTotal := uint64(stat.Blocks) * 512
+	fmt.Printf("Mapped %v, Unknown %v, Total %v\n", mem.RTMapped, filememTotal, filememTotal+mem.RTMapped)
+
 	return nil
 }
 

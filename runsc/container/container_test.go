@@ -16,6 +16,7 @@ package container
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -2595,5 +2596,213 @@ func TestRlimitsExec(t *testing.T) {
 	}
 	if want := "100\n"; string(got) != want {
 		t.Errorf("ulimit result, got: %q, want: %q", got, want)
+	}
+}
+
+// TestCat creates a file and checks that cat generates the expected output.
+func TestCat(t *testing.T) {
+	dir, err := ioutil.TempDir(testutil.TmpDir(), "test-cat")
+	if err != nil {
+		t.Fatalf("ioutil.TempDir() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	source := path.Join(dir, "source")
+	if err := os.MkdirAll(source, 0777); err != nil {
+		t.Fatalf("os.MkdirAll(): %v", err)
+	}
+
+	f, err := os.Create(path.Join(source, "file"))
+	if err != nil {
+		t.Fatalf("os.Create(): %v", err)
+	}
+	content := "test-cat"
+	if _, err := f.WriteString(content); err != nil {
+		t.Fatalf("f.WriteString(): %v", err)
+	}
+	f.Close()
+
+	spec := testutil.NewSpecWithArgs("sleep", "20")
+	conf := testutil.TestConfig(t)
+
+	spec.Mounts = append(spec.Mounts, specs.Mount{
+		Type:        "bind",
+		Destination: source,
+		Source:      source,
+	})
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("Creating container: %v", err)
+	}
+	defer cont.Destroy()
+
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("starting container: %v", err)
+	}
+
+	// Fake stdout through a pipe to capture stdout results.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+
+	stdout := os.Stdout
+	os.Stdout = w
+	defer func() {
+		os.Stdout = stdout
+	}()
+
+	if err := cont.Cat([]string{path.Join(source, "file")}); err != nil {
+		t.Errorf("error cat from container: %v", err)
+	}
+
+	buf := make([]byte, 1024)
+	if _, err := r.Read(buf); err != nil {
+		t.Fatalf("Read stdout: %v", err)
+	}
+	if got, want := string(buf), content; !strings.Contains(got, want) {
+		t.Errorf("stdout got %s, want include %s", buf, want)
+	}
+}
+
+// TestUsage checks that usage generates the expected memory usage.
+func TestUsage(t *testing.T) {
+	spec := testutil.NewSpecWithArgs("sleep", "20")
+	conf := testutil.TestConfig(t)
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("Creating container: %v", err)
+	}
+	defer cont.Destroy()
+
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("starting container: %v", err)
+	}
+
+	for _, full := range []bool{false, true} {
+		// Fake stdout through a pipe to capture stdout results.
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("os.Pipe(): %v", err)
+		}
+
+		stdout := os.Stdout
+		os.Stdout = w
+		defer func() {
+			os.Stdout = stdout
+		}()
+
+		if err := cont.Usage(full); err != nil {
+			t.Fatalf("error usage from container: %v", err)
+		}
+
+		buf := make([]byte, 1024)
+		if _, err := r.Read(buf); err != nil {
+			t.Fatalf("Read stdout: %v", err)
+		}
+
+		var m control.MemoryUsage
+		if err := json.NewDecoder(strings.NewReader(string(buf))).Decode(&m); err != nil {
+			t.Fatalf("Decode buf %s: %v", buf, err)
+		}
+		if m.Mapped == 0 {
+			t.Errorf("Usage mapped got zero")
+		}
+		if m.Total == 0 {
+			t.Errorf("Usage total got zero")
+		}
+		if full {
+			if m.System == 0 {
+				t.Errorf("Usage system got zero")
+			}
+			if m.Anonymous == 0 {
+				t.Errorf("Usage anonymous got zero")
+			}
+		}
+	}
+}
+
+// TestUsageFD checks that usagefd generates the expected memory usage.
+func TestUsageFD(t *testing.T) {
+	spec := testutil.NewSpecWithArgs("sleep", "20")
+	conf := testutil.TestConfig(t)
+
+	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+	if err != nil {
+		t.Fatalf("error setting up container: %v", err)
+	}
+	defer cleanup()
+
+	args := Args{
+		ID:        testutil.RandomContainerID(),
+		Spec:      spec,
+		BundleDir: bundleDir,
+	}
+
+	cont, err := New(conf, args)
+	if err != nil {
+		t.Fatalf("Creating container: %v", err)
+	}
+	defer cont.Destroy()
+
+	if err := cont.Start(conf); err != nil {
+		t.Fatalf("starting container: %v", err)
+	}
+
+	// Fake stdout through a pipe to capture stdout results.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe(): %v", err)
+	}
+
+	stdout := os.Stdout
+	os.Stdout = w
+	defer func() {
+		os.Stdout = stdout
+	}()
+
+	if err := cont.UsageFD(); err != nil {
+		t.Fatalf("error usageFD from container: %v", err)
+	}
+
+	buf := make([]byte, 1024)
+	if _, err := r.Read(buf); err != nil {
+		t.Fatalf("Read stdout: %v", err)
+	}
+
+	if got, want := string(buf), "Mapped"; !strings.Contains(got, want) {
+		t.Errorf("stdout got %s, want include %s", buf, want)
+	}
+	if got, want := string(buf), "Unknown"; !strings.Contains(got, want) {
+		t.Errorf("stdout got %s, want include %s", buf, want)
+	}
+	if got, want := string(buf), "Total"; !strings.Contains(got, want) {
+		t.Errorf("stdout got %s, want include %s", buf, want)
 	}
 }

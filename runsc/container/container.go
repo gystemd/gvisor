@@ -646,6 +646,24 @@ func (c *Container) Resume() error {
 	return c.saveLocked()
 }
 
+// Cat prints out the content of the files.
+func (c *Container) Cat(files []string) error {
+	log.Debugf("Cat in container, cid: %s, files: %+v", c.ID, files)
+	return c.Sandbox.Cat(c.ID, files)
+}
+
+// Usage displays memory used by the application.
+func (c *Container) Usage(Full bool) error {
+	log.Debugf("Usage in container, cid: %s, Full: %v", c.ID, Full)
+	return c.Sandbox.Usage(c.ID, Full)
+}
+
+// UsageFD shows application memory usage using two donated FDs.
+func (c *Container) UsageFD() error {
+	log.Debugf("UsageFD in container, cid: %s", c.ID)
+	return c.Sandbox.UsageFD(c.ID)
+}
+
 // State returns the metadata of the container.
 func (c *Container) State() specs.State {
 	return specs.State{
