@@ -13,14 +13,18 @@
 // limitations under the License.
 
 #include <errno.h>
+#include <signal.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>
 #include <sys/types.h>
 
+#include "absl/synchronization/notification.h"
 #include "absl/time/clock.h"
 #include "test/util/capability_util.h"
+#include "test/util/signal_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
+#include "test/util/thread_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -29,6 +33,8 @@ namespace {
 constexpr int msgMax = 8192;   // Max size for message in bytes.
 constexpr int msgMni = 32000;  // Max number of identifiers.
 constexpr int msgMnb = 16384;  // Default max size of message queue in bytes.
+
+constexpr int kInterruptSignal = SIGALRM;
 
 // Queue is a RAII class used to automatically clean message queues.
 class Queue {
@@ -53,6 +59,14 @@ class Queue {
   int id_ = -1;
 };
 
+PosixErrorOr<Queue> Msgget(key_t key, int flags) {
+  int id = msgget(key, flags);
+  if (id == -1) {
+    return PosixError(errno, absl::StrFormat("msgget(%d, %d)", key, flags));
+  }
+  return Queue(id);
+}
+
 // Default size for messages.
 constexpr size_t msgSize = 50;
 
@@ -72,14 +86,19 @@ bool operator==(msgbuf& a, msgbuf& b) {
   return a.mtype == b.mtype;
 }
 
+// msgmax represents a buffer for the largest possible single message.
+struct msgmax {
+  int64_t mtype;
+  char mtext[msgMax];
+};
+
 // Test simple creation and retrieval for msgget(2).
 TEST(MsgqueueTest, MsgGet) {
   const TempPath keyfile = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
   const key_t key = ftok(keyfile.path().c_str(), 1);
   ASSERT_THAT(key, SyscallSucceeds());
 
-  Queue queue(msgget(key, IPC_CREAT));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(key, IPC_CREAT));
   EXPECT_THAT(msgget(key, 0), SyscallSucceedsWithValue(queue.get()));
 }
 
@@ -91,27 +110,20 @@ TEST(MsgqueueTest, MsgGetFail) {
 
   EXPECT_THAT(msgget(key, 0), SyscallFailsWithErrno(ENOENT));
 
-  Queue queue(msgget(key, IPC_CREAT));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
-
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(key, IPC_CREAT));
   EXPECT_THAT(msgget(key, IPC_CREAT | IPC_EXCL), SyscallFailsWithErrno(EEXIST));
 }
 
 // Test using msgget(2) with IPC_PRIVATE option.
 TEST(MsgqueueTest, MsgGetIpcPrivate) {
-  Queue queue1(msgget(IPC_PRIVATE, 0));
-  ASSERT_THAT(queue1.get(), SyscallSucceeds());
-
-  Queue queue2(msgget(IPC_PRIVATE, 0));
-  ASSERT_THAT(queue2.get(), SyscallSucceeds());
-
+  Queue queue1 = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0));
+  Queue queue2 = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0));
   EXPECT_NE(queue1.get(), queue2.get());
 }
 
 // Test simple msgsnd and msgrcv.
 TEST(MsgqueueTest, MsgOpSimple) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   msgbuf buf{1, "A message."};
   msgbuf rcv;
@@ -126,8 +138,7 @@ TEST(MsgqueueTest, MsgOpSimple) {
 
 // Test msgsnd and msgrcv of an empty message.
 TEST(MsgqueueTest, MsgOpEmpty) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   msgbuf buf{1, ""};
   msgbuf rcv;
@@ -139,8 +150,7 @@ TEST(MsgqueueTest, MsgOpEmpty) {
 
 // Test truncation of message with MSG_NOERROR flag.
 TEST(MsgqueueTest, MsgOpTruncate) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   msgbuf buf{1, ""};
   msgbuf rcv;
@@ -154,8 +164,7 @@ TEST(MsgqueueTest, MsgOpTruncate) {
 
 // Test msgsnd and msgrcv using invalid arguments.
 TEST(MsgqueueTest, MsgOpInvalidArgs) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   msgbuf buf{1, ""};
 
@@ -172,8 +181,7 @@ TEST(MsgqueueTest, MsgOpInvalidArgs) {
 
 // Test non-blocking msgrcv with an empty queue.
 TEST(MsgqueueTest, MsgOpNoMsg) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   msgbuf rcv;
   EXPECT_THAT(msgrcv(queue.get(), &rcv, sizeof(rcv.mtext) + 1, 0, IPC_NOWAIT),
@@ -183,8 +191,7 @@ TEST(MsgqueueTest, MsgOpNoMsg) {
 // Test non-blocking msgrcv with a non-empty queue, but no messages of wanted
 // type.
 TEST(MsgqueueTest, MsgOpNoMsgType) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   msgbuf buf{1, ""};
   ASSERT_THAT(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0),
@@ -196,8 +203,7 @@ TEST(MsgqueueTest, MsgOpNoMsgType) {
 
 // Test msgrcv with a larger size message than wanted, and truncation disabled.
 TEST(MsgqueueTest, MsgOpTooBig) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   msgbuf buf{1, ""};
   ASSERT_THAT(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0),
@@ -209,8 +215,7 @@ TEST(MsgqueueTest, MsgOpTooBig) {
 
 // Test receiving messages based on type.
 TEST(MsgqueueTest, MsgRcvType) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   // Send messages in an order and receive them in reverse, based on type,
   // which shouldn't block.
@@ -236,8 +241,7 @@ TEST(MsgqueueTest, MsgRcvType) {
 
 // Test using MSG_EXCEPT to receive a different-type message.
 TEST(MsgqueueTest, MsgExcept) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   std::map<int64_t, msgbuf> typeToBuf = {
       {1, msgbuf{1, "Message 1."}},
@@ -262,8 +266,7 @@ TEST(MsgqueueTest, MsgExcept) {
 
 // Test msgrcv with a negative type.
 TEST(MsgqueueTest, MsgRcvTypeNegative) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   //  When msgtyp is negative, msgrcv returns the first message with mtype less
   //  than or equal to the absolute value.
@@ -286,8 +289,7 @@ TEST(MsgqueueTest, MsgRcvTypeNegative) {
 TEST(MsgqueueTest, MsgOpPermissions) {
   AutoCapability cap(CAP_IPC_OWNER, false);
 
-  Queue queue(msgget(IPC_PRIVATE, 0000));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0000));
 
   msgbuf buf{1, ""};
 
@@ -299,8 +301,7 @@ TEST(MsgqueueTest, MsgOpPermissions) {
 
 // Test limits for messages and queues.
 TEST(MsgqueueTest, MsgOpLimits) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
   msgbuf buf{1, "A message."};
 
@@ -309,13 +310,6 @@ TEST(MsgqueueTest, MsgOpLimits) {
               SyscallFailsWithErrno(EINVAL));
 
   // Limit for queue.
-  // Use a buffer with the maximum mount of bytes that can be transformed to
-  // make it easier to exhaust the queue limit.
-  struct msgmax {
-    int64_t mtype;
-    char mtext[msgMax];
-  };
-
   msgmax limit{1, ""};
   for (size_t i = 0, msgCount = msgMnb / msgMax; i < msgCount; i++) {
     EXPECT_THAT(msgsnd(queue.get(), &limit, sizeof(limit.mtext), 0),
@@ -335,11 +329,14 @@ bool MsgCopySupported() {
   // test if errno == ENOSYS. This means that the test will always run on
   // gVisor, but may be skipped on native linux.
 
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-
+  auto maybe_id = Msgget(IPC_PRIVATE, 0600);
+  if (!maybe_id.ok()) {
+    return false;
+  }
+  Queue queue(maybe_id.ValueOrDie());
   msgbuf buf{1, "Test message."};
-  msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0);
 
+  msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0);
   return !(msgrcv(queue.get(), &buf, sizeof(buf.mtext) + 1, 0,
                   MSG_COPY | IPC_NOWAIT) == -1 &&
            errno == ENOSYS);
@@ -349,9 +346,7 @@ bool MsgCopySupported() {
 TEST(MsgqueueTest, MsgCopy) {
   SKIP_IF(!MsgCopySupported());
 
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
-
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
   msgbuf bufs[5] = {
       msgbuf{1, "Message 1."}, msgbuf{2, "Message 2."}, msgbuf{3, "Message 3."},
       msgbuf{4, "Message 4."}, msgbuf{5, "Message 5."},
@@ -385,9 +380,7 @@ TEST(MsgqueueTest, MsgCopy) {
 TEST(MsgqueueTest, MsgCopyInvalidArgs) {
   SKIP_IF(!MsgCopySupported());
 
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
-
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
   msgbuf rcv;
   EXPECT_THAT(msgrcv(queue.get(), &rcv, msgSize, 1, MSG_COPY),
               SyscallFailsWithErrno(EINVAL));
@@ -401,9 +394,7 @@ TEST(MsgqueueTest, MsgCopyInvalidArgs) {
 TEST(MsgqueueTest, MsgCopyInvalidIndex) {
   SKIP_IF(!MsgCopySupported());
 
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
-
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
   msgbuf rcv;
   EXPECT_THAT(msgrcv(queue.get(), &rcv, msgSize, -3, MSG_COPY | IPC_NOWAIT),
               SyscallFailsWithErrno(ENOMSG));
@@ -414,52 +405,41 @@ TEST(MsgqueueTest, MsgCopyInvalidIndex) {
 
 // Test msgrcv (most probably) blocking on an empty queue.
 TEST(MsgqueueTest, MsgRcvBlocking) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
-
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
   msgbuf buf{1, "A message."};
 
-  const pid_t child_pid = fork();
-  if (child_pid == 0) {
+  ScopedThread t([&] {
     msgbuf rcv;
-    TEST_PCHECK(RetryEINTR(msgrcv)(queue.get(), &rcv, sizeof(buf.mtext) + 1, 0,
-                                   0) == sizeof(buf.mtext) &&
-                buf == rcv);
-    _exit(0);
-  }
+    ASSERT_THAT(
+        RetryEINTR(msgrcv)(queue.get(), &rcv, sizeof(buf.mtext) + 1, 0, 0),
+        SyscallSucceedsWithValue(sizeof(buf.mtext)));
+    EXPECT_TRUE(rcv == buf);
+  });
 
   // Sleep to try and make msgrcv block before sending a message.
   absl::SleepFor(absl::Milliseconds(150));
 
   EXPECT_THAT(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0),
               SyscallSucceeds());
-
-  int status;
-  ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, 0),
-              SyscallSucceedsWithValue(child_pid));
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 // Test msgrcv (most probably) waiting for a specific-type message.
 TEST(MsgqueueTest, MsgRcvTypeBlocking) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
-
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
   msgbuf bufs[5] = {{1, "A message."},
                     {1, "A message."},
                     {1, "A message."},
                     {1, "A message."},
                     {2, "A different message."}};
 
-  const pid_t child_pid = fork();
-  if (child_pid == 0) {
+  ScopedThread t([&] {
     msgbuf buf = bufs[4];  // Buffer that should be received.
     msgbuf rcv;
-    TEST_PCHECK(RetryEINTR(msgrcv)(queue.get(), &rcv, sizeof(buf.mtext) + 1, 2,
-                                   0) == sizeof(buf.mtext) &&
-                buf == rcv);
-    _exit(0);
-  }
+    ASSERT_THAT(
+        RetryEINTR(msgrcv)(queue.get(), &rcv, sizeof(buf.mtext) + 1, 2, 0),
+        SyscallSucceedsWithValue(sizeof(buf.mtext)));
+    EXPECT_TRUE(rcv == buf);
+  });
 
   // Sleep to try and make msgrcv block before sending messages.
   absl::SleepFor(absl::Milliseconds(150));
@@ -469,42 +449,29 @@ TEST(MsgqueueTest, MsgRcvTypeBlocking) {
     EXPECT_THAT(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0),
                 SyscallSucceeds());
   }
-
-  int status;
-  ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, 0),
-              SyscallSucceedsWithValue(child_pid));
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 // Test msgsnd (most probably) blocking on a full queue.
 TEST(MsgqueueTest, MsgSndBlocking) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
-
-  // Use a buffer with the maximum mount of bytes that can be transformed to
-  // make it easier to exhaust the queue limit.
-  struct msgmax {
-    int64_t mtype;
-    char mtext[msgMax];
-  };
-
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
   msgmax buf{1, ""};  // Has max amount of bytes.
 
   const size_t msgCount = msgMnb / msgMax;  // Number of messages that can be
                                             // sent without blocking.
 
-  const pid_t child_pid = fork();
-  if (child_pid == 0) {
+  ScopedThread t([&] {
     // Fill the queue.
     for (size_t i = 0; i < msgCount; i++) {
-      TEST_PCHECK(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0) == 0);
+      ASSERT_THAT(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0),
+                  SyscallSucceeds());
     }
 
     // Next msgsnd should block.
-    TEST_PCHECK(RetryEINTR(msgsnd)(queue.get(), &buf, sizeof(buf.mtext), 0) ==
-                0);
-    _exit(0);
-  }
+    ASSERT_THAT(RetryEINTR(msgsnd)(queue.get(), &buf, sizeof(buf.mtext), 0),
+                SyscallSucceeds());
+  });
+
+  const DisableSave ds;  // Too many syscalls.
 
   // To increase the chance of the last msgsnd blocking before doing a msgrcv,
   // we use MSG_COPY option to copy the last index in the queue. As long as
@@ -521,29 +488,16 @@ TEST(MsgqueueTest, MsgSndBlocking) {
 
   EXPECT_THAT(msgrcv(queue.get(), &rcv, sizeof(buf.mtext), 0, 0),
               SyscallSucceedsWithValue(sizeof(buf.mtext)));
-
-  int status;
-  ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, 0),
-              SyscallSucceedsWithValue(child_pid));
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 // Test removing a queue while a blocking msgsnd is executing.
 TEST(MsgqueueTest, MsgSndRmWhileBlocking) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
-  // Use a buffer with the maximum mount of bytes that can be transformed to
-  // make it easier to exhaust the queue limit.
-  struct msgmax {
-    int64_t mtype;
-    char mtext[msgMax];
-  };
+  // Number of messages that can be sent without blocking.
+  const size_t msgCount = msgMnb / msgMax;
 
-  const size_t msgCount = msgMnb / msgMax;  // Number of messages that can be
-                                            // sent without blocking.
-  const pid_t child_pid = fork();
-  if (child_pid == 0) {
+  ScopedThread t([&] {
     // Fill the queue.
     msgmax buf{1, ""};
     for (size_t i = 0; i < msgCount; i++) {
@@ -553,11 +507,12 @@ TEST(MsgqueueTest, MsgSndRmWhileBlocking) {
 
     // Next msgsnd should block. Because we're repeating on EINTR, msgsnd may
     // race with msgctl(IPC_RMID) and return EINVAL.
-    TEST_PCHECK(RetryEINTR(msgsnd)(queue.get(), &buf, sizeof(buf.mtext), 0) ==
-                    -1 &&
-                (errno == EIDRM || errno == EINVAL));
-    _exit(0);
-  }
+    EXPECT_THAT(RetryEINTR(msgsnd)(queue.get(), &buf, sizeof(buf.mtext), 0),
+                SyscallFails());
+    EXPECT_TRUE((errno == EIDRM || errno == EINVAL));
+  });
+
+  const DisableSave ds;  // Too many syscalls.
 
   // Similar to MsgSndBlocking, we do this to increase the chance of msgsnd
   // blocking before removing the queue.
@@ -569,91 +524,180 @@ TEST(MsgqueueTest, MsgSndRmWhileBlocking) {
   absl::SleepFor(absl::Milliseconds(100));
 
   EXPECT_THAT(msgctl(queue.release(), IPC_RMID, nullptr), SyscallSucceeds());
-
-  int status;
-  ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, 0),
-              SyscallSucceedsWithValue(child_pid));
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 // Test removing a queue while a blocking msgrcv is executing.
 TEST(MsgqueueTest, MsgRcvRmWhileBlocking) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
-  const pid_t child_pid = fork();
-  if (child_pid == 0) {
+  ScopedThread t([&] {
     // Because we're repeating on EINTR, msgsnd may race with msgctl(IPC_RMID)
     // and return EINVAL.
     msgbuf rcv;
-    TEST_PCHECK(RetryEINTR(msgrcv)(queue.get(), &rcv, 1, 2, 0) == -1 &&
-                (errno == EIDRM || errno == EINVAL));
-    _exit(0);
-  }
+    EXPECT_THAT(RetryEINTR(msgrcv)(queue.get(), &rcv, 1, 2, 0), SyscallFails());
+    EXPECT_TRUE(errno == EIDRM || errno == EINVAL);
+  });
 
   // Sleep to try and make msgrcv block before sending messages.
   absl::SleepFor(absl::Milliseconds(150));
 
   EXPECT_THAT(msgctl(queue.release(), IPC_RMID, nullptr), SyscallSucceeds());
-
-  int status;
-  ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, 0),
-              SyscallSucceedsWithValue(child_pid));
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 // Test a collection of msgsnd/msgrcv operations in different processes.
 TEST(MsgqueueTest, MsgOpGeneral) {
-  Queue queue(msgget(IPC_PRIVATE, 0600));
-  ASSERT_THAT(queue.get(), SyscallSucceeds());
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
 
-  // Create 50 sending, and 50 receiving processes. There are only 5 messages to
-  // be sent and received, each with a different type. All messages will be sent
-  // and received equally (10 of each.) By the end of the test all processes
-  // should unblock and return normally.
-  const size_t msgCount = 5;
-  std::map<int64_t, msgbuf> typeToBuf = {{1, msgbuf{1, "Message 1."}},
-                                         {2, msgbuf{2, "Message 2."}},
-                                         {3, msgbuf{3, "Message 3."}},
-                                         {4, msgbuf{4, "Message 4."}},
-                                         {5, msgbuf{5, "Message 5."}}};
+  // Create multiple sending/receiving threads that send messages back and
+  // forth. There's a matching recv for each send, so by the end of the test,
+  // all threads should succeed and return.
+  const std::vector<msgbuf> msgs = {
+      msgbuf{1, "Message 1."}, msgbuf{2, "Message 2."}, msgbuf{3, "Message 3."},
+      msgbuf{4, "Message 4."}, msgbuf{5, "Message 5."}};
 
-  std::vector<pid_t> children;
-
-  const size_t pCount = 50;
-  for (size_t i = 1; i <= pCount; i++) {
-    const pid_t child_pid = fork();
-    if (child_pid == 0) {
-      msgbuf buf = typeToBuf[(i % msgCount) + 1];
+  auto receiver = [&](int i) {
+    return [i, &msgs, &queue]() {
+      const msgbuf& target = msgs[i];
       msgbuf rcv;
-      TEST_PCHECK(RetryEINTR(msgrcv)(queue.get(), &rcv, sizeof(buf.mtext) + 1,
-                                     (i % msgCount) + 1,
-                                     0) == sizeof(buf.mtext) &&
-                  buf == rcv);
-      _exit(0);
-    }
-    children.push_back(child_pid);
+      EXPECT_THAT(RetryEINTR(msgrcv)(queue.get(), &rcv,
+                                     sizeof(target.mtext) + 1, target.mtype, 0),
+                  SyscallSucceedsWithValue(sizeof(target.mtext)));
+      EXPECT_EQ(rcv.mtype, target.mtype);
+      EXPECT_EQ(0, memcmp(rcv.mtext, target.mtext, sizeof(target.mtext)));
+    };
+  };
+
+  ScopedThread r1(receiver(0));
+  ScopedThread r2(receiver(1));
+  ScopedThread r3(receiver(2));
+  ScopedThread r4(receiver(3));
+  ScopedThread r5(receiver(4));
+  ScopedThread r6(receiver(0));
+  ScopedThread r7(receiver(1));
+  ScopedThread r8(receiver(2));
+  ScopedThread r9(receiver(3));
+  ScopedThread r10(receiver(4));
+
+  auto sender = [&](int i) {
+    return [i, &msgs, &queue]() {
+      const msgbuf& target = msgs[i];
+      EXPECT_THAT(
+          RetryEINTR(msgsnd)(queue.get(), &target, sizeof(target.mtext), 0),
+          SyscallSucceeds());
+    };
+  };
+
+  ScopedThread s1(sender(0));
+  ScopedThread s2(sender(1));
+  ScopedThread s3(sender(2));
+  ScopedThread s4(sender(3));
+  ScopedThread s5(sender(4));
+  ScopedThread s6(sender(0));
+  ScopedThread s7(sender(1));
+  ScopedThread s8(sender(2));
+  ScopedThread s9(sender(3));
+  ScopedThread s10(sender(4));
+}
+
+void empty_sighandler(int sig, siginfo_t* info, void* context) {}
+
+TEST(MsgqueueTest, InterruptRecv) {
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
+  char buf[64];
+
+  absl::Notification done, exit;
+
+  // Thread calling msgrcv with no corresponding send. It would block forever,
+  // but we'll interrupt with a signal below.
+  ScopedThread t([&] {
+    struct sigaction sa = {};
+    sa.sa_sigaction = empty_sighandler;
+    sigfillset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    auto cleanup_sigaction =
+        ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(kInterruptSignal, sa));
+    auto sa_cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+        ScopedSignalMask(SIG_UNBLOCK, kInterruptSignal));
+
+    EXPECT_THAT(msgrcv(queue.get(), &buf, sizeof(buf), 0, 0),
+                SyscallFailsWithErrno(EINTR));
+
+    done.Notify();
+    exit.WaitForNotification();
+  });
+
+  const DisableSave ds;  // Too many syscalls.
+
+  // We want the signal to arrive while msgrcv is blocking, but not after the
+  // thread has exited. Signals that arrive before msgrcv are no-ops.
+  do {
+    EXPECT_THAT(kill(getpid(), kInterruptSignal), SyscallSucceeds());
+    absl::SleepFor(absl::Milliseconds(100));  // Rate limit.
+  } while (!done.HasBeenNotified());
+
+  exit.Notify();
+  t.Join();
+}
+
+TEST(MsgqueueTest, InterruptSend) {
+  Queue queue = ASSERT_NO_ERRNO_AND_VALUE(Msgget(IPC_PRIVATE, 0600));
+  msgmax buf{1, ""};
+  // Number of messages that can be sent without blocking.
+  const size_t msgCount = msgMnb / msgMax;
+
+  // Fill the queue.
+  for (size_t i = 0; i < msgCount; i++) {
+    ASSERT_THAT(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0),
+                SyscallSucceeds());
   }
 
-  for (size_t i = 1; i <= pCount; i++) {
-    const pid_t child_pid = fork();
-    if (child_pid == 0) {
-      msgbuf buf = typeToBuf[(i % msgCount) + 1];
-      TEST_PCHECK(RetryEINTR(msgsnd)(queue.get(), &buf, sizeof(buf.mtext), 0) ==
-                  0);
-      _exit(0);
-    }
-    children.push_back(child_pid);
-  }
+  absl::Notification done, exit;
 
-  for (auto const& pid : children) {
-    int status;
-    ASSERT_THAT(RetryEINTR(waitpid)(pid, &status, 0),
-                SyscallSucceedsWithValue(pid));
-    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-  }
+  // Thread calling msgsnd on a full queue. It would block forever, but we'll
+  // interrupt with a signal below.
+  ScopedThread t([&] {
+    struct sigaction sa = {};
+    sa.sa_sigaction = empty_sighandler;
+    sigfillset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    auto cleanup_sigaction =
+        ASSERT_NO_ERRNO_AND_VALUE(ScopedSigaction(kInterruptSignal, sa));
+    auto sa_cleanup = ASSERT_NO_ERRNO_AND_VALUE(
+        ScopedSignalMask(SIG_UNBLOCK, kInterruptSignal));
+
+    EXPECT_THAT(msgsnd(queue.get(), &buf, sizeof(buf.mtext), 0),
+                SyscallFailsWithErrno(EINTR));
+
+    done.Notify();
+    exit.WaitForNotification();
+  });
+
+  const DisableSave ds;  // Too many syscalls.
+
+  // We want the signal to arrive while msgsnd is blocking, but not after the
+  // thread has exited. Signals that arrive before msgsnd are no-ops.
+  do {
+    EXPECT_THAT(kill(getpid(), kInterruptSignal), SyscallSucceeds());
+    absl::SleepFor(absl::Milliseconds(100));  // Rate limit.
+  } while (!done.HasBeenNotified());
+
+  exit.Notify();
+  t.Join();
 }
 
 }  // namespace
 }  // namespace testing
 }  // namespace gvisor
+
+int main(int argc, char** argv) {
+  // Some tests depend on delivering a signal to the main thread. Block the
+  // target signal so that any other threads created by TestInit will also have
+  // the signal blocked.
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, gvisor::testing::kInterruptSignal);
+  TEST_PCHECK(sigprocmask(SIG_BLOCK, &set, nullptr) == 0);
+
+  gvisor::testing::TestInit(&argc, &argv);
+  return gvisor::testing::RunAllTests();
+}
