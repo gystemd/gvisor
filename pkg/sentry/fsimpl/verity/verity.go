@@ -1091,6 +1091,18 @@ func (fd *fileDescription) enableVerity(ctx context.Context) (uintptr, error) {
 		return 0, fd.d.fs.alertIntegrityViolation("Unexpected verity fd: missing expected underlying fds")
 	}
 
+	// Populate children names.
+	if fd.d.isDir() {
+		if err := fd.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
+			if dirent.Name != "." && dirent.Name != ".." {
+				fd.d.childrenNames[dirent.Name] = struct{}{}
+			}
+			return nil
+		})); err != nil {
+			return 0, err
+		}
+	}
+
 	hash, dataSize, err := fd.generateMerkleLocked(ctx)
 	if err != nil {
 		return 0, err
